@@ -1,0 +1,448 @@
+//@version=6
+// Bollinger Adaptive Inverted — Compression Breakout (Hybrid v2)
+// - Signals-only vs Strategy toggle
+// - USDJPY 1H & 30m presets
+// - Adaptive length (ER/KAMA-style)
+// - Dynamic σ scaling by ER
+// - Compression: Percentile / Absolute / ATR-Z / Combined
+// - Min volatility-expansion bars after compression
+// - Multi-bar breakout confirmation (0–3)
+// - Trend EMA + optional HTF slope alignment + RSI w/ skip at high ATR-Z
+// - Volume spike + expansion
+// - Cooldown / re-arm logic
+// - Top-right dashboard (state + performance)
+// - Performance shows USD (net of $2.25/side commissions) + pips, with separate Long/Short
+
+strategy("BB Adaptive Inverted — Compression Breakout (Hybrid v2)",
+     overlay = true,
+     initial_capital = 10000,
+     currency = currency.USD,
+     calc_on_every_tick = true,
+     process_orders_on_close = false,
+     commission_type = strategy.commission.cash_per_order,
+     commission_value = 2.25, // $2.25 per side
+     max_labels_count = 500,
+     max_lines_count  = 500)
+
+//──────────────────────────────────────────────────────────────────────────────
+// GROUPS
+//──────────────────────────────────────────────────────────────────────────────
+grpMODE = "Mode & Presets"
+grpBB   = "Bollinger & Adaptivity"
+grpCMP  = "Compression Logic"
+grpVOL  = "Volatility & Volume"
+grpFLTR = "Trend & Momentum Filters"
+grpCONF = "Breakout Confirmation"
+grpRISK = "Risk & Orders (Strategy Mode)"
+grpBT   = "Backtest Window"
+grpVIS  = "Visuals"
+
+//──────────────────────────────────────────────────────────────────────────────
+// MODE & PRESETS
+//──────────────────────────────────────────────────────────────────────────────
+signalsOnly     = input.bool(false, "Signals Only (no trades)", group=grpMODE)
+preset          = input.string("USDJPY 1H", "Preset", options=["USDJPY 1H","USDJPY 30m"], group=grpMODE)
+usePresetParams = input.bool(true, "Use Preset Overrides", group=grpMODE)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BOLLINGER & ADAPTIVITY
+//──────────────────────────────────────────────────────────────────────────────
+baseLen     = input.int(22, "Base Length", minval=5, group=grpBB)
+minLen      = input.int(12, "Adaptive Min Length", minval=5, group=grpBB)
+maxLen      = input.int(45, "Adaptive Max Length", minval=10, group=grpBB)
+useAdaptive = input.bool(true, "Use Adaptive Length (ER/KAMA-style)", group=grpBB)
+stdevMult   = input.float(2.0, "StdDev Multiplier (σ)", step=0.1, group=grpBB)
+useDynSigma = input.bool(true, "Auto-Adjust σ by ER (Dynamic σ)", group=grpBB)
+sigmaBoost  = input.float(0.8, "σ Boost Strength (0–1.5)", step=0.1, minval=0, maxval=1.5, group=grpBB)
+src         = input.source(close, "Source", group=grpBB)
+
+//──────────────────────────────────────────────────────────────────────────────
+// COMPRESSION LOGIC
+//──────────────────────────────────────────────────────────────────────────────
+cmpMode      = input.string("Combined", "Compression Mode", options=["Percentile","Absolute","ATR Z-Score","Combined"], group=grpCMP)
+cmpLookback  = input.int(250, "Percentile Lookback", minval=50, group=grpCMP)
+cmpPercent   = input.int(20, "Width Percentile ≤", minval=1, maxval=50, group=grpCMP)
+cmpAbsTh     = input.float(0.0125, "Absolute Width ≤ (e.g., 0.0125 = 1.25%)", step=0.0001, group=grpCMP)
+minCmpBars   = input.int(6, "Min Bars in Compression", minval=1, group=grpCMP)
+rearmBars    = input.int(12, "Cooldown / Rearm Bars After Signal", minval=1, group=grpCMP)
+
+//──────────────────────────────────────────────────────────────────────────────
+// VOLATILITY & VOLUME
+//──────────────────────────────────────────────────────────────────────────────
+atr_period         = input.int(14, "ATR Period", minval=5, group=grpVOL)
+atr_std_lookback   = input.int(50, "ATR Std Lookback", minval=20, group=grpVOL)
+atrZThreshold      = input.float(-1.2, "Compression ATR Z-Score ≤", step=0.1, group=grpVOL)
+short_vol_period   = input.int(5, "Short ATR (Vol Ratio)", minval=3, maxval=20, group=grpVOL)
+long_vol_period    = input.int(20, "Long ATR (Vol Ratio)", minval=10, maxval=100, group=grpVOL)
+vol_ratio_threshold = input.float(1.25, "Volatility Ratio ≥", minval=1.0, group=grpVOL)
+minExpBars         = input.int(2, "Min Vol-Expansion Bars After Compression", minval=0, maxval=5, group=grpVOL)
+
+useVolExp   = input.bool(true, "Volume Filter ON", group=grpVOL)
+volMaLen    = input.int(50, "Volume MA Length", minval=5, group=grpVOL)
+volSpikeK   = input.float(1.2, "Volume Spike ≥ MA ×", minval=1.0, maxval=3.0, step=0.05, group=grpVOL)
+
+//──────────────────────────────────────────────────────────────────────────────
+// TREND & MOMENTUM
+//──────────────────────────────────────────────────────────────────────────────
+useTrend   = input.bool(true, "Trend Filter ON", group=grpFLTR)
+ema_fast   = input.int(55, "Fast EMA", minval=10, group=grpFLTR)
+ema_slow   = input.int(220, "Slow EMA", minval=20, group=grpFLTR)
+useHTF     = input.bool(true, "Use HTF Trend (EMA slope)", group=grpFLTR)
+htfTF      = input.string("240", "HTF (minutes)", group=grpFLTR)
+htfMaLen   = input.int(100, "HTF EMA Length", minval=20, group=grpFLTR)
+
+useRSI     = input.bool(true, "RSI Momentum Filter ON", group=grpFLTR)
+rsi_period = input.int(14, "RSI Period", minval=7, group=grpFLTR)
+skipRSIOnHighATR = input.bool(true, "Skip RSI when ATR-Z strong", group=grpFLTR)
+skipATRZLevel    = input.float(1.8, "Skip RSI if ATR-Z ≥", step=0.1, group=grpFLTR)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BREAKOUT CONFIRMATION
+//──────────────────────────────────────────────────────────────────────────────
+entryMode   = input.string("Close", "Breakout Confirmation Type", options=["Close","Wick","Close+Buffer"], group=grpCONF)
+bufferATR   = input.float(0.10, "ATR Buffer (for Close+Buffer)", step=0.05, group=grpCONF)
+useConfirmBars = input.bool(true, "Require Multi-Bar Confirmation", group=grpCONF)
+confirmBars = input.int(2, "Confirm Bars (0–3)", minval=0, maxval=3, group=grpCONF)
+
+//──────────────────────────────────────────────────────────────────────────────
+// RISK & ORDERS (STRATEGY MODE)
+//──────────────────────────────────────────────────────────────────────────────
+risk_per_trade      = input.float(2.0, "Risk % Per Trade", minval=0.1, maxval=10.0, step=0.1, group=grpRISK)
+atr_stop_multiplier = input.float(2.0, "ATR Stop Multiplier", minval=1.0, maxval=5.0, step=0.1, group=grpRISK)
+
+//──────────────────────────────────────────────────────────────────────────────
+// BACKTEST WINDOW
+//──────────────────────────────────────────────────────────────────────────────
+startTime = input.time(timestamp("2024-01-01T00:00:00"), "Start Date/Time", group=grpBT)
+endTime   = input.time(timestamp("2030-01-01T00:00:00"), "End Date/Time", group=grpBT)
+inRange   = time >= startTime and time < endTime
+
+//──────────────────────────────────────────────────────────────────────────────
+// PRESET OVERRIDES
+//──────────────────────────────────────────────────────────────────────────────
+float effSigma     = stdevMult
+int   effBaseLen   = baseLen
+int   effMinLen    = minLen
+int   effMaxLen    = maxLen
+int   effCmpPct    = cmpPercent
+float effAtrZThr   = atrZThreshold
+float effVolRatio  = vol_ratio_threshold
+int   effMinCmp    = minCmpBars
+int   effRearm     = rearmBars
+int   effMinExp    = minExpBars
+int   effEmaFast   = ema_fast
+int   effEmaSlow   = ema_slow
+int   effConfirm   = confirmBars
+
+if usePresetParams
+    if preset == "USDJPY 1H"
+        effSigma   := 2.0
+        effBaseLen := 22
+        effMinLen  := 12
+        effMaxLen  := 45
+        effCmpPct  := 20
+        effAtrZThr := -1.2
+        effVolRatio := 1.25
+        effMinCmp  := 6
+        effRearm   := 12
+        effMinExp  := 2
+        effEmaFast := 55
+        effEmaSlow := 220
+        effConfirm := 2
+    else
+        effSigma   := 1.5
+        effBaseLen := 20
+        effMinLen  := 10
+        effMaxLen  := 40
+        effCmpPct  := 25
+        effAtrZThr := -0.8
+        effVolRatio := 1.15
+        effMinCmp  := 4
+        effRearm   := 8
+        effMinExp  := 1
+        effEmaFast := 50
+        effEmaSlow := 200
+        effConfirm := 1
+
+//──────────────────────────────────────────────────────────────────────────────
+// ADAPTIVE LENGTH (ER) + DYNAMIC σ
+//──────────────────────────────────────────────────────────────────────────────
+erLen   = math.max(10, effBaseLen)
+change  = math.abs(src - nz(src[erLen]))
+volSum  = ta.sum(math.abs(src - src[1]), erLen)
+er      = volSum != 0.0 ? change/volSum : 0.0
+
+adaptLenF = useAdaptive ? math.round(effMaxLen - er * (effMaxLen - effMinLen)) : effBaseLen
+adaptLen  = math.clamp(adaptLenF, effMinLen, effMaxLen)
+
+// widen σ in chop (low ER), tighten in strong trend (high ER)
+sigmaEff = useDynSigma ? (effSigma * (1.0 + sigmaBoost * (1.0 - er))) : effSigma
+
+//──────────────────────────────────────────────────────────────────────────────
+// BOLLINGER + WIDTH
+//──────────────────────────────────────────────────────────────────────────────
+basis = ta.sma(src, adaptLen)
+dev   = ta.stdev(src, adaptLen)
+upper = basis + sigmaEff * dev
+lower = basis - sigmaEff * dev
+bbWidth = basis != 0.0 ? (upper - lower) / basis : 0.0
+
+f_percentile(_s, _lb, _p) =>
+    ta.percentile_linear_interpolation(_s, _lb, math.clamp(_p, 1, 99))
+
+widthPct   = f_percentile(bbWidth, cmpLookback, effCmpPct)
+cmpNow_abs = bbWidth <= cmpAbsTh
+cmpNow_pct = bbWidth <= widthPct
+
+// ATR framework
+atr    = ta.atr(atr_period)
+atr_ma = ta.sma(atr, atr_std_lookback)
+atr_sd = ta.stdev(atr, atr_std_lookback)
+atr_z  = atr_sd != 0 ? (atr - atr_ma) / atr_sd : 0.0
+
+shortATR = ta.atr(short_vol_period)
+longATR  = ta.atr(long_vol_period)
+volRatio = longATR != 0 ? (shortATR / longATR) : 0.0
+
+cmpNow_atr = atr_z <= effAtrZThr
+
+bool cmpNow = switch cmpMode
+    "Percentile"   => cmpNow_pct
+    "Absolute"     => cmpNow_abs
+    "ATR Z-Score"  => cmpNow_atr
+    => cmpNow_pct and cmpNow_atr
+
+cmpBars = cmpNow ? nz(cmpBars[1]) + 1 : 0
+inCompression = cmpBars >= effMinCmp
+
+//──────────────────────────────────────────────────────────────────────────────
+// FILTERS
+//──────────────────────────────────────────────────────────────────────────────
+emaFast = ta.ema(src, effEmaFast)
+emaSlow = ta.ema(src, effEmaSlow)
+primaryUp   = emaFast > emaSlow and src > emaFast
+primaryDown = emaFast < emaSlow and src < emaFast
+
+htfOkUp = true
+htfOkDn = true
+if useHTF
+    htfEma = request.security(syminfo.tickerid, htfTF, ta.ema(src, htfMaLen), barmerge.gaps_off, barmerge.lookahead_off)
+    htfOkUp := htfEma > htfEma[1]
+    htfOkDn := htfEma < htfEma[1]
+
+trendOKlong  = useTrend ? (primaryUp   and htfOkUp) : true
+trendOKshort = useTrend ? (primaryDown and htfOkDn) : true
+
+rsi = ta.rsi(src, rsi_period)
+useRSINow    = useRSI and not (skipRSIOnHighATR and atr_z >= skipATRZLevel)
+momentum_up   = useRSINow ? (rsi > 45 and rsi < 80) : true
+momentum_down = useRSINow ? (rsi < 55 and rsi > 20) : true
+
+volMA     = ta.sma(volume, volMaLen)
+volSpike  = volume > volMA * volSpikeK
+volExpand = volume > volMA
+volOK     = useVolExp ? (volSpike and volExpand) : true
+
+// Volatility expansion gating
+volatility_expansion = volRatio >= effVolRatio
+expCount = volatility_expansion ? nz(expCount[1]) + 1 : 0
+
+//──────────────────────────────────────────────────────────────────────────────
+// ARMED / BREAKOUT / CONFIRMATION
+//──────────────────────────────────────────────────────────────────────────────
+var int cooldown = 0
+cooldown := cooldown > 0 ? cooldown - 1 : 0
+armed = inCompression and cooldown == 0
+
+// Breakout tests
+breakUpClose   = close > upper
+breakDnClose   = close < lower
+breakUpWick    = high  > upper
+breakDnWick    = low   < lower
+breakUpBuffer  = close > (upper + (atr * bufferATR))
+breakDnBuffer  = close < (lower - (atr * bufferATR))
+
+longBreak = switch entryMode
+    "Close"        => breakUpClose
+    "Wick"         => breakUpWick
+    => breakUpBuffer
+
+shortBreak = switch entryMode
+    "Close"        => breakDnClose
+    "Wick"         => breakDnWick
+    => breakDnBuffer
+
+// Multi-bar breakout confirmation outside band
+longConfirmed  = useConfirmBars ? (ta.barssince(close <= upper) > effConfirm) : true
+shortConfirmed = useConfirmBars ? (ta.barssince(close >= lower) > effConfirm) : true
+
+leftCompression = not inCompression and nz(inCompression[1])
+expansionOK     = expCount >= effMinExp
+
+longSignal  = (armed or leftCompression) and longBreak  and longConfirmed  and trendOKlong  and momentum_up   and volOK and expansionOK
+shortSignal = (armed or leftCompression) and shortBreak and shortConfirmed and trendOKshort and momentum_down and volOK and expansionOK
+
+if longSignal or shortSignal
+    cooldown := effRearm
+
+//──────────────────────────────────────────────────────────────────────────────
+// EXECUTION (Strategy Mode)
+//──────────────────────────────────────────────────────────────────────────────
+equity       = strategy.initial_capital + strategy.netprofit
+risk_amount  = equity * (risk_per_trade / 100.0)
+atr_risk     = atr * atr_stop_multiplier
+qty          = atr_risk != 0 ? (risk_amount / atr_risk) : 0.0
+
+long_entry_price  = entryMode == "Close+Buffer" ? (upper + (atr * bufferATR)) : upper
+short_entry_price = entryMode == "Close+Buffer" ? (lower - (atr * bufferATR)) : lower
+long_stop_price   = long_entry_price  - (atr * atr_stop_multiplier)
+short_stop_price  = short_entry_price + (atr * atr_stop_multiplier)
+
+if inRange and not signalsOnly
+    if longSignal
+        strategy.entry("Long", strategy.long, qty=qty, limit=long_entry_price)
+        strategy.exit("Long SL", from_entry="Long", stop=long_stop_price)
+    if shortSignal
+        strategy.entry("Short", strategy.short, qty=qty, limit=short_entry_price)
+        strategy.exit("Short SL", from_entry="Short", stop=short_stop_price)
+
+//──────────────────────────────────────────────────────────────────────────────
+// LONG/SHORT SPLIT (runtime attribution on close)
+//──────────────────────────────────────────────────────────────────────────────
+pipValueUSD = syminfo.mintick * syminfo.pointvalue
+
+var int   lastDir   = 0           //  1 = last opened long, -1 = last opened short
+var float longNetUSD = 0.0
+var float shortNetUSD = 0.0
+var float longPips = 0.0
+var float shortPips = 0.0
+
+// Detect entries to set lastDir
+openedLong  = strategy.position_size > 0 and strategy.position_size[1] == 0
+openedShort = strategy.position_size < 0 and strategy.position_size[1] == 0
+if openedLong
+    lastDir := 1
+if openedShort
+    lastDir := -1
+
+// Attribute profit on the bar a trade closes (delta netprofit)
+closedNow = strategy.closedtrades > strategy.closedtrades[1]
+profitDeltaUSD = strategy.netprofit - nz(strategy.netprofit[1])
+if closedNow
+    if lastDir > 0
+        longNetUSD  += profitDeltaUSD
+        longPips    += pipValueUSD != 0 ? (profitDeltaUSD / pipValueUSD) : 0
+    if lastDir < 0
+        shortNetUSD += profitDeltaUSD
+        shortPips   += pipValueUSD != 0 ? (profitDeltaUSD / pipValueUSD) : 0
+    // reset lastDir when flat
+    if strategy.position_size == 0
+        lastDir := 0
+
+//──────────────────────────────────────────────────────────────────────────────
+// VISUALS
+//──────────────────────────────────────────────────────────────────────────────
+showBands   = input.bool(true, "Show Bands", group=grpVIS)
+showBasis   = input.bool(true, "Show Basis", group=grpVIS)
+showCmpBG   = input.bool(true, "Shade Compression", group=grpVIS)
+showArmedBG = input.bool(true, "Shade Armed (mild)", group=grpVIS)
+showSignals = input.bool(true, "Show Entry Triangles", group=grpVIS)
+showPanel   = input.bool(true, "Show Top-Right Panel (State + Performance)", group=grpVIS)
+
+plot(showBasis ? basis : na, "Basis", color=color.new(color.gray, 0))
+plot(showBands ? upper : na, "Upper", color=color.new(color.gray, 0))
+plot(showBands ? lower : na, "Lower", color=color.new(color.gray, 0))
+
+bgcolor(showCmpBG and inCompression ? color.new(color.teal, 88) : na)
+bgcolor(showArmedBG and armed ? color.new(color.yellow, 92) : na)
+
+plotshape(showSignals and longSignal,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, size=size.tiny, color=color.new(color.lime, 0))
+plotshape(showSignals and shortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.new(color.red, 0))
+
+//──────────────────────────────────────────────────────────────────────────────
+// COMBINED TOP-RIGHT PANEL (STATE + PERFORMANCE)
+//──────────────────────────────────────────────────────────────────────────────
+if showPanel and barstate.islast
+    var table panel = table.new(position.top_right, 4, 18, bgcolor=color.new(color.black, 0), border_width=1)
+
+    // Section: State (Adaptive + Vol)
+    table.cell(panel, 0, 0, "STATE", text_color=color.white, bgcolor=color.new(color.gray, 30), colspan=4)
+    table.cell(panel, 0, 1, "Preset", text_color=color.white)
+    table.cell(panel, 1, 1, preset, text_color=color.white)
+    table.cell(panel, 2, 1, "Adapt Len", text_color=color.white)
+    table.cell(panel, 3, 1, str.tostring(adaptLen), text_color=color.white)
+
+    table.cell(panel, 0, 2, "σ (eff.)", text_color=color.white)
+    table.cell(panel, 1, 2, str.tostring(sigmaEff, "0.00"), text_color=color.new(color.teal, 0))
+    table.cell(panel, 2, 2, "BB Width %", text_color=color.white)
+    table.cell(panel, 3, 2, str.tostring(bbWidth*100, "0.00") + "%", text_color=color.new(color.teal, 0))
+
+    table.cell(panel, 0, 3, "ATR-Z", text_color=color.white)
+    table.cell(panel, 1, 3, str.tostring(atr_z, "0.00"), text_color=color.new(color.aqua, 0))
+    table.cell(panel, 2, 3, "Vol Ratio", text_color=color.white)
+    table.cell(panel, 3, 3, str.tostring(volRatio, "0.00"), text_color=color.new(color.aqua, 0))
+
+    table.cell(panel, 0, 4, "Compression", text_color=color.white)
+    table.cell(panel, 1, 4, inCompression ? "YES" : "NO", text_color=inCompression?color.lime:color.red)
+    table.cell(panel, 2, 4, "Armed", text_color=color.white)
+    table.cell(panel, 3, 4, armed ? "YES" : "NO", text_color=armed?color.yellow:color.red)
+
+    // Section: Performance
+    table.cell(panel, 0, 6, "PERFORMANCE", text_color=color.white, bgcolor=color.new(color.gray, 30), colspan=4)
+
+    closedTrades = strategy.closedtrades
+    grossProfit  = strategy.grossprofit
+    grossLoss    = strategy.grossloss
+    profitFactor = grossLoss != 0 ? (grossProfit / math.abs(grossLoss)) : na
+    wins         = strategy.wintrades
+    winRate      = closedTrades > 0 ? (wins / closedTrades) * 100 : na
+
+    // IMPORTANT: strategy.netprofit ALREADY includes commissions (since commission_value is set).
+    // We'll show that as true "Net Profit (USD) after fees", and also show the estimated fees paid.
+    feesPaidUSD  = closedTrades * 2 * 2.25
+    netProfitUSD = strategy.netprofit
+    netProfitPips = pipValueUSD != 0 ? (netProfitUSD / pipValueUSD) : na
+
+    avgTradeUSD  = closedTrades > 0 ? (netProfitUSD / closedTrades) : na
+    expectancyR  = (atr_risk != 0 and avgTradeUSD != na) ? (avgTradeUSD / atr_risk) : na
+
+    // Totals
+    table.cell(panel, 0, 7, "Trades", text_color=color.white)
+    table.cell(panel, 1, 7, str.tostring(closedTrades), text_color=color.yellow)
+    table.cell(panel, 2, 7, "Win Rate", text_color=color.white)
+    table.cell(panel, 3, 7, (winRate != na ? str.tostring(winRate, "0.0") + "%" : "na"), text_color=color.lime)
+
+    table.cell(panel, 0, 8, "Profit Factor", text_color=color.white)
+    table.cell(panel, 1, 8, (profitFactor != na ? str.tostring(profitFactor, "0.00") : "na"), text_color=color.new(color.teal, 0))
+    table.cell(panel, 2, 8, "Fees Paid", text_color=color.white)
+    table.cell(panel, 3, 8, "$" + str.tostring(feesPaidUSD, "0.00"), text_color=color.new(color.orange, 0))
+
+    table.cell(panel, 0, 9, "Net Profit (USD)", text_color=color.white)
+    table.cell(panel, 1, 9, "$" + str.tostring(netProfitUSD, "0.00"), text_color=netProfitUSD >= 0 ? color.lime : color.red)
+    table.cell(panel, 2, 9, "Net Profit (Pips)", text_color=color.white)
+    table.cell(panel, 3, 9, (netProfitPips != na ? str.tostring(netProfitPips, "0.1") : "na"), text_color=netProfitPips >= 0 ? color.lime : color.red)
+
+    table.cell(panel, 0,10, "Avg Trade (USD)", text_color=color.white)
+    table.cell(panel, 1,10, (avgTradeUSD != na ? "$" + str.tostring(avgTradeUSD, "0.2f") : "na"), text_color=color.new(color.aqua, 0))
+    table.cell(panel, 2,10, "Expectancy (R)", text_color=color.white)
+    table.cell(panel, 3,10, (expectancyR != na ? str.tostring(expectancyR, "0.2f") : "na"), text_color=color.new(color.orange, 0))
+
+    // Section: Split Long / Short
+    table.cell(panel, 0, 12, "LONG / SHORT SPLIT", text_color=color.white, bgcolor=color.new(color.gray, 30), colspan=4)
+
+    table.cell(panel, 0, 13, "Long USD", text_color=color.white)
+    table.cell(panel, 1, 13, "$" + str.tostring(longNetUSD, "0.00"), text_color=longNetUSD >= 0 ? color.lime : color.red)
+    table.cell(panel, 2, 13, "Long Pips", text_color=color.white)
+    table.cell(panel, 3, 13, str.tostring(longPips, "0.1"), text_color=longPips >= 0 ? color.lime : color.red)
+
+    table.cell(panel, 0, 14, "Short USD", text_color=color.white)
+    table.cell(panel, 1, 14, "$" + str.tostring(shortNetUSD, "0.00"), text_color=shortNetUSD >= 0 ? color.lime : color.red)
+    table.cell(panel, 2, 14, "Short Pips", text_color=color.white)
+    table.cell(panel, 3, 14, str.tostring(shortPips, "0.1"), text_color=shortPips >= 0 ? color.lime : color.red)
+
+    // Tiny legend line
+    table.cell(panel, 0, 16, "Note: Net Profit is after $2.25/side commissions.", text_color=color.new(color.white, 0), colspan=4)
+
+// Alerts
+alertcondition(longSignal,  title="BB Inverted Adaptive — LONG",  message="LONG breakout: compression release + expansion confirmed.")
+alertcondition(shortSignal, title="BB Inverted Adaptive — SHORT", message="SHORT breakout: compression release + expansion confirmed.")
