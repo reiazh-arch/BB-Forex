@@ -273,8 +273,10 @@ shortBreak = switch entryMode
     => breakDnBuffer
 
 // Multi-bar breakout confirmation outside band
-longConfirmed  = useConfirmBars ? (ta.barssince(close <= upper) > effConfirm) : true
-shortConfirmed = useConfirmBars ? (ta.barssince(close >= lower) > effConfirm) : true
+barsSinceLongBack = ta.barssince(close <= upper)
+barsSinceShortBack = ta.barssince(close >= lower)
+longConfirmed  = useConfirmBars ? (not na(barsSinceLongBack) and barsSinceLongBack > effConfirm) : true
+shortConfirmed = useConfirmBars ? (not na(barsSinceShortBack) and barsSinceShortBack > effConfirm) : true
 
 leftCompression = not inCompression and nz(inCompression[1])
 expansionOK     = expCount >= effMinExp
@@ -299,10 +301,10 @@ long_stop_price   = long_entry_price  - (atr * atr_stop_multiplier)
 short_stop_price  = short_entry_price + (atr * atr_stop_multiplier)
 
 if inRange and not signalsOnly
-    if longSignal
+    if longSignal and qty > 0
         strategy.entry("Long", strategy.long, qty=qty, limit=long_entry_price)
         strategy.exit("Long SL", from_entry="Long", stop=long_stop_price)
-    if shortSignal
+    if shortSignal and qty > 0
         strategy.entry("Short", strategy.short, qty=qty, limit=short_entry_price)
         strategy.exit("Short SL", from_entry="Short", stop=short_stop_price)
 
@@ -423,9 +425,9 @@ if showPanel and barstate.islast
     table.cell(panel, 3, 9, (netProfitPips != na ? str.tostring(netProfitPips, "0.1") : "na"), text_color=netProfitPips >= 0 ? color.lime : color.red)
 
     table.cell(panel, 0,10, "Avg Trade (USD)", text_color=color.white)
-    table.cell(panel, 1,10, (avgTradeUSD != na ? "$" + str.tostring(avgTradeUSD, "0.2f") : "na"), text_color=color.new(color.aqua, 0))
+    table.cell(panel, 1,10, (avgTradeUSD != na ? "$" + str.tostring(avgTradeUSD, "0.00") : "na"), text_color=color.new(color.aqua, 0))
     table.cell(panel, 2,10, "Expectancy (R)", text_color=color.white)
-    table.cell(panel, 3,10, (expectancyR != na ? str.tostring(expectancyR, "0.2f") : "na"), text_color=color.new(color.orange, 0))
+    table.cell(panel, 3,10, (expectancyR != na ? str.tostring(expectancyR, "0.00") : "na"), text_color=color.new(color.orange, 0))
 
     // Section: Split Long / Short
     table.cell(panel, 0, 12, "LONG / SHORT SPLIT", text_color=color.white, bgcolor=color.new(color.gray, 30), colspan=4)
